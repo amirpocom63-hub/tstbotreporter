@@ -34,6 +34,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    ForceReply,
 )
 
 logging.basicConfig(
@@ -46,7 +47,7 @@ TELEGRAM_TOKEN = "8179859382:AAHnhHIa5-DXV923UfRdbEgOUnLO5P79qIs"
 ADMIN_IDS: set[int] = {8503523539}
 ADMIN_USERNAME = "@Saeqehe"
 
-ADMIN_CARD_NUMBER = "6219861453153586"  # ← شماره کارت خودت را اینجا بگذار
+ADMIN_CARD_NUMBER = "6219861453153586"
 PREMIUM_MONTHS   = 1
 
 REQUIRED_CHANNELS = ["mrvpn294", "amirwebcode1"]
@@ -70,6 +71,16 @@ REPORT_TYPES_MAP: dict[str, tuple[str, ReportType]] = {
     "6": ("🎣 فیشینگ",        ReportType.FISHING),
     "7": ("📝 سایر",          ReportType.OTHER),
 }
+
+# کلیدواژه‌هایی که نشان می‌دهند هدف تعلیق/مسدود شده
+SUSPEND_KEYWORDS = (
+    "ban", "suspend", "deactiv", "block", "not found",
+    "invalid peer", "peer_id_invalid", "user_banned", "chat_banned",
+    "access denied", "forbidden",
+)
+
+# وضعیت زنده گزارش‌دهی (in-memory) — برای نمایش به ادمین
+ACTIVE_REPORTS: dict[int, dict] = {}
 
 user_stop: dict[int, bool] = {}
 
@@ -96,6 +107,12 @@ class Form(StatesGroup):
     admin_reply      = State()
 
 
+class AdminGrantFlow(StatesGroup):
+    waiting_user     = State()
+    waiting_quota    = State()
+    waiting_duration = State()
+
+
 # ────────────────────────────────────────────────────────────────────────
 #  DB
 # ────────────────────────────────────────────────────────────────────────
@@ -110,19 +127,49 @@ def init_db() -> None:
                 rubika_private_key TEXT,
                 is_premium         INTEGER DEFAULT 0,
                 premium_until      TEXT,
+                custom_quota       INTEGER,
+                custom_expiry      TEXT,
+                subscription_source TEXT DEFAULT 'free',
                 coins              INTEGER DEFAULT 0,
                 total_reports      INTEGER DEFAULT 0,
                 total_invites      INTEGER DEFAULT 0,
                 last_daily_reward  TEXT,
+                is_reporting       INTEGER DEFAULT 0,
                 created_at         TEXT DEFAULT (datetime('now'))
             )
         """)
-        for col, ctype in [("rubika_auth", "TEXT"), ("rubika_private_key", "TEXT"), ("last_daily_reward", "TEXT")]:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id     INTEGER NOT NULL,
+                target_guid     TEXT NOT NULL,
+                target_type     TEXT DEFAULT 'unknown',
+                target_username TEXT,
+                report_type     TEXT,
+                count           INTEGER DEFAULT 1,
+                status          TEXT DEFAULT 'sent',
+                is_suspended    INTEGER DEFAULT 0,
+                reported_at     TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_tg ON reports(telegram_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_target ON reports(target_guid)")
+
+        for col, ctype in [
+            ("rubika_auth", "TEXT"),
+            ("rubika_private_key", "TEXT"),
+            ("last_daily_reward", "TEXT"),
+            ("custom_quota", "INTEGER"),
+            ("custom_expiry", "TEXT"),
+            ("subscription_source", "TEXT DEFAULT 'free'"),
+            ("is_reporting", "INTEGER DEFAULT 0"),
+        ]:
             try:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ctype}")
             except sqlite3.OperationalError:
                 pass
         conn.commit()
+
 
 def get_user(telegram_id: int) -> dict | None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -131,6 +178,7 @@ def get_user(telegram_id: int) -> dict | None:
             "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
         ).fetchone()
         return dict(row) if row else None
+
 
 def upsert_user(telegram_id: int, **kwargs) -> None:
     existing = get_user(telegram_id)
@@ -151,6 +199,7 @@ def upsert_user(telegram_id: int, **kwargs) -> None:
             )
         conn.commit()
 
+
 def add_stats(telegram_id: int, sent: int) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -159,19 +208,20 @@ def add_stats(telegram_id: int, sent: int) -> None:
         )
         conn.commit()
 
+
 def get_all_users() -> list[dict]:
-    """تمام کاربران ثبت‌شده در ربات را برمی‌گرداند."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM users").fetchall()
     return [dict(r) for r in rows]
 
+
 def count_users() -> int:
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
+
 def get_all_valid_sessions() -> list[str]:
-    """تمام سشن‌های معتبر (فایل موجود) اضافه‌شده به ربات را برمی‌گرداند."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -179,17 +229,136 @@ def get_all_valid_sessions() -> list[str]:
         ).fetchall()
     return [r["rubika_session"] for r in rows if session_exists(r["rubika_session"])]
 
+
 def is_premium_active(user: dict) -> bool:
-    if not user.get("is_premium"):
+    if not user or not user.get("is_premium"):
         return False
     until = user.get("premium_until")
     if not until:
         return False
-    return datetime.now() < datetime.fromisoformat(until)
+    try:
+        return datetime.now() < datetime.fromisoformat(until)
+    except (ValueError, TypeError):
+        return False
 
-def set_premium(telegram_id: int, months: int = 1) -> None:
+
+def is_custom_active(user: dict) -> bool:
+    if not user:
+        return False
+    expiry = user.get("custom_expiry")
+    quota = user.get("custom_quota")
+    if not expiry or not quota:
+        return False
+    try:
+        return datetime.now() < datetime.fromisoformat(expiry)
+    except (ValueError, TypeError):
+        return False
+
+
+def get_effective_limit(user: dict | None) -> int:
+    if not user:
+        return FREE_LIMIT
+    if is_custom_active(user):
+        try:
+            return max(int(user["custom_quota"]), 1)
+        except (ValueError, TypeError):
+            pass
+    if is_premium_active(user):
+        return PREMIUM_LIMIT
+    return FREE_LIMIT
+
+
+def set_premium(telegram_id: int, months: int = 1, source: str = "purchased") -> None:
     until = (datetime.now() + timedelta(days=30 * months)).isoformat()
-    upsert_user(telegram_id, is_premium=1, premium_until=until)
+    upsert_user(
+        telegram_id,
+        is_premium=1,
+        premium_until=until,
+        subscription_source=source,
+    )
+
+
+def set_custom_subscription(telegram_id: int, quota: int, duration: timedelta, admin_id: int | None = None) -> None:
+    until = (datetime.now() + duration).isoformat()
+    upsert_user(
+        telegram_id,
+        custom_quota=int(quota),
+        custom_expiry=until,
+        subscription_source="admin_gift",
+        is_premium=1,
+    )
+
+
+def clear_subscription(telegram_id: int) -> None:
+    upsert_user(
+        telegram_id,
+        is_premium=0,
+        premium_until=None,
+        custom_quota=None,
+        custom_expiry=None,
+        subscription_source="free",
+    )
+
+
+# ─── گزارش‌ها ────────────────────────────────────────────────────────────
+def log_report_run(
+    telegram_id: int,
+    target_guid: str,
+    target_type: str,
+    target_username: str | None,
+    report_type_label: str,
+    count: int,
+    status: str = "sent",
+    is_suspended: bool = False,
+) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """INSERT INTO reports
+               (telegram_id, target_guid, target_type, target_username,
+                report_type, count, status, is_suspended)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                telegram_id, target_guid, target_type,
+                target_username, report_type_label, count, status,
+                1 if is_suspended else 0,
+            ),
+        )
+        conn.commit()
+
+
+def mark_target_suspended(telegram_id: int, target_guid: str, suspended: bool) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE reports SET is_suspended = ? WHERE telegram_id = ? AND target_guid = ?",
+            (1 if suspended else 0, telegram_id, target_guid),
+        )
+        conn.commit()
+
+
+def get_user_unique_targets(tg_id: int) -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT target_guid,
+                   MAX(target_username)  AS target_username,
+                   MAX(target_type)      AS target_type,
+                   SUM(count)            AS total_count,
+                   MAX(reported_at)      AS last_report,
+                   MAX(is_suspended)     AS suspended
+            FROM reports
+            WHERE telegram_id = ?
+            GROUP BY target_guid
+            ORDER BY last_report DESC
+        """, (tg_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_user_targets(tg_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            "SELECT COUNT(DISTINCT target_guid) FROM reports WHERE telegram_id = ?",
+            (tg_id,),
+        ).fetchone()[0]
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -211,7 +380,9 @@ def _normalize_phone(phone: str) -> Optional[str]:
         return phone
     return None
 
+
 SESSION_EXTENSIONS = (".rp", ".rubika", ".session")
+
 
 def session_exists(session_path: str | None) -> bool:
     if not session_path:
@@ -219,16 +390,70 @@ def session_exists(session_path: str | None) -> bool:
     return any(os.path.isfile(session_path + ext) for ext in SESSION_EXTENSIONS) or os.path.isfile(session_path)
 
 
-# پیشوندهای واقعی شناسه‌های روبیکا (کاربر، کانال، گروه، ربات و ...)
 GUID_PREFIXES = ("u0", "c0", "g0", "b0", "m0", "s0", "o0", "p0", "ch0", "t0", "e0")
 
 
 def looks_like_guid(text: str) -> bool:
-    """فقط شناسه‌های واقعی روبیکا را تشخیص می‌دهد (نه یوزرنیم)."""
     text = text.strip()
     if any(text.startswith(p) for p in GUID_PREFIXES):
         return bool(re.match(r"^(u0|c0|g0|b0|m0|s0|o0|p0|ch0|t0|e0)[A-Za-z0-9_\-]{6,}$", text))
     return False
+
+
+def detect_target_type(guid: str) -> str:
+    if not guid:
+        return "unknown"
+    if guid.startswith("u0"):
+        return "user"
+    if guid.startswith("c0"):
+        return "channel"
+    if guid.startswith("g0"):
+        return "group"
+    if guid.startswith("b0"):
+        return "bot"
+    return "unknown"
+
+
+TARGET_TYPE_FA = {
+    "user": "کاربر",
+    "channel": "چنل",
+    "group": "گروه",
+    "bot": "ربات",
+    "unknown": "نامشخص",
+}
+
+
+def is_suspension_error(err_str: str) -> bool:
+    err = (err_str or "").lower()
+    return any(kw in err for kw in SUSPEND_KEYWORDS)
+
+
+def parse_duration(s: str) -> timedelta | None:
+    s = (s or "").strip().lower()
+    m = re.match(r"^(\d+)([dhms])$", s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if n <= 0:
+        return None
+    return {
+        "d": timedelta(days=n),
+        "h": timedelta(hours=n),
+        "m": timedelta(minutes=n),
+        "s": timedelta(seconds=n),
+    }[m.group(2)]
+
+
+def format_duration(td: timedelta) -> str:
+    total = int(td.total_seconds())
+    if total < 60:
+        return f"{total} ثانیه"
+    if total < 3600:
+        return f"{total // 60} دقیقه"
+    if total < 86400:
+        return f"{total // 3600} ساعت"
+    return f"{total // 86400} روز"
+
 
 def cleanup_session_files(session_path: str | None) -> None:
     if not session_path:
@@ -248,12 +473,13 @@ async def check_user_membership(bot: Bot, user_id: int) -> bool:
     for channel in REQUIRED_CHANNELS:
         try:
             member = await bot.get_chat_member(chat_id=f"@{channel}", user_id=user_id)
-            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED, ChatMemberStatus.KICKED):
+            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
                 return False
         except Exception as exc:
-            logger.warning("check_member @%s user=%d: %s (بات ادمین کانال نیست؟)", channel, user_id, exc)
+            logger.warning("check_member @%s user=%d: %s", channel, user_id, exc)
             return False
     return True
+
 
 def kb_force_join() -> InlineKeyboardMarkup:
     buttons = []
@@ -286,6 +512,7 @@ async def rubika_send_code(phone: str, pass_key: str = None) -> dict:
         await client.disconnect()
         cleanup_session_files(tmp_path)
 
+
 async def rubika_sign_in(phone: str, code: str, phone_code_hash: str) -> dict:
     session_name = f"user_{phone}"
     session_path = os.path.join(SESSIONS_DIR, session_name)
@@ -299,12 +526,10 @@ async def rubika_sign_in(phone: str, code: str, phone_code_hash: str) -> dict:
             phone_code_hash=phone_code_hash,
             public_key=public_key,
         )
-
         if result.status != "OK":
             raise RuntimeError(f"خطا در ورود: {result.status}")
 
         decrypted_auth = Crypto.decrypt_RSA_OAEP(private_key, result.auth)
-
         client.auth = decrypted_auth
         client.key = Crypto.passphrase(decrypted_auth)
         client.decode_auth = Crypto.decode_auth(decrypted_auth)
@@ -319,7 +544,6 @@ async def rubika_sign_in(phone: str, code: str, phone_code_hash: str) -> dict:
             phone_number=phone,
             private_key=private_key,
         )
-
         await client.register_device(device_model=session_name)
         await client.disconnect()
 
@@ -335,29 +559,71 @@ async def rubika_sign_in(phone: str, code: str, phone_code_hash: str) -> dict:
 
 
 # ────────────────────────────────────────────────────────────────────────
-#  Keyboards with colors
+#  Suspension check
 # ────────────────────────────────────────────────────────────────────────
-def colored_button(text: str, callback_data: str = None, url: str = None, style: ButtonStyle = ButtonStyle.PRIMARY) -> InlineKeyboardButton:
-    """ساخت دکمه شیشه‌ای رنگی"""
-    if url:
-        return InlineKeyboardButton(text=text, url=url, style=style)
-    return InlineKeyboardButton(text=text, callback_data=callback_data, style=style)
+async def check_suspension_via_rubpy(session_path: str, target_guid: str) -> bool | None:
+    if not session_path or not session_exists(session_path):
+        return None
+    try:
+        client = RubikaClient(name=session_path)
+        async with client:
+            try:
+                if target_guid.startswith(("u0", "b0")):
+                    info = await client.get_user_info(target_guid)
+                else:
+                    info = await client.get_chat(target_guid)
 
+                for attr in ("banned", "is_banned", "is_deleted", "deactivated",
+                             "user_ban_changed_banned", "is_blocked"):
+                    val = getattr(info, attr, None)
+                    if val is True:
+                        return True
+                status = getattr(info, "status", None)
+                if isinstance(status, str) and status.lower() in ("banned", "deleted", "blocked"):
+                    return True
+                return False
+            except Exception as e:
+                err = str(e).lower()
+                if any(kw in err for kw in SUSPEND_KEYWORDS):
+                    return True
+                logger.warning("check_suspension: %s", e)
+                return None
+    except Exception as e:
+        logger.error("check_suspension outer: %s", e)
+        return None
+
+
+async def _background_suspension_check(tg_id: int, target_guid: str, session_path: str | None):
+    if not session_path:
+        return
+    suspended = await check_suspension_via_rubpy(session_path, target_guid)
+    if suspended is not None:
+        mark_target_suspended(tg_id, target_guid, suspended)
+
+
+# ────────────────────────────────────────────────────────────────────────
+#  Keyboards
+# ────────────────────────────────────────────────────────────────────────
 def kb_phone() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📱 ارسال شماره تماس", request_contact=True)]],
         resize_keyboard=True,
     )
 
+
 def kb_main(premium: bool) -> InlineKeyboardMarkup:
-    plan_label = "⭐ ویژه" if premium else "🔹خرید اشتراک"
+    plan_label = "⭐ اشتراک ویژه" if premium else "💎 خرید اشتراک"
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🚨 گزارش تخلف", callback_data="start_report", style=ButtonStyle.DANGER),
             InlineKeyboardButton(text="📊 وضعیت حساب", callback_data="account_status", style=ButtonStyle.PRIMARY),
         ],
         [
-            InlineKeyboardButton(text=f"💎 {plan_label}", callback_data="subscription", style=ButtonStyle.SUCCESS),
+            InlineKeyboardButton(text="📋 گزارش‌های من", callback_data="my_reports_0", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="🔄 بروزرسانی وضعیت اهداف", callback_data="refresh_statuses", style=ButtonStyle.PRIMARY),
+        ],
+        [
+            InlineKeyboardButton(text=plan_label, callback_data="subscription", style=ButtonStyle.SUCCESS),
             InlineKeyboardButton(text="🎁 جایزه روزانه", callback_data="daily_reward", style=ButtonStyle.SUCCESS),
         ],
         [
@@ -368,6 +634,7 @@ def kb_main(premium: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📞 ارتباط با ما / پشتیبانی", callback_data="support", style=ButtonStyle.DANGER),
         ],
     ])
+
 
 def kb_menu_return() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -382,11 +649,15 @@ def kb_admin_panel() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 آمار ربات", callback_data="admin_stats", style=ButtonStyle.PRIMARY),
         ],
         [
-            InlineKeyboardButton(text="👑 تمدید اشتراک", callback_data="admin_grant", style=ButtonStyle.SUCCESS),
-            InlineKeyboardButton(text="💬 پشتیبانی", callback_data="admin_support", style=ButtonStyle.DANGER),
+            InlineKeyboardButton(text="👥 مدیریت کاربران", callback_data="admin_users_0", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="💎 اعطای اشتراک سفارشی", callback_data="admin_custom_sub", style=ButtonStyle.SUCCESS),
         ],
         [
-            InlineKeyboardButton(text="📨 لیست کاربران", callback_data="admin_list", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="🟢 در حال اجرا", callback_data="admin_live", style=ButtonStyle.SUCCESS),
+            InlineKeyboardButton(text="📋 لاگ گزارش‌ها", callback_data="admin_logs_0", style=ButtonStyle.PRIMARY),
+        ],
+        [
+            InlineKeyboardButton(text="💬 پشتیبانی", callback_data="admin_support", style=ButtonStyle.DANGER),
             InlineKeyboardButton(text="🚪 خروج از پنل", callback_data="admin_exit", style=ButtonStyle.DANGER),
         ],
     ])
@@ -404,6 +675,7 @@ def kb_admin_reply(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🚫 بستن", callback_data="admin_close_ticket", style=ButtonStyle.DANGER)],
     ])
 
+
 def kb_report_types(selected: set) -> InlineKeyboardMarkup:
     buttons = []
     for k, (label, _) in REPORT_TYPES_MAP.items():
@@ -416,28 +688,95 @@ def kb_report_types(selected: set) -> InlineKeyboardMarkup:
 
 def kb_report_guid_choice() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 دریافت شناسه با یوزرنیم/آیدی", callback_data="get_by_username", style=ButtonStyle.DANGER)],
+        [InlineKeyboardButton(text="✍️ وارد کردن شناسه دستی", callback_data="enter_guid", style=ButtonStyle.PRIMARY)],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_menu", style=ButtonStyle.PRIMARY)],
+    ])
+
+
+def kb_user_reports(page: int, total_pages: int, owner_id: int | None = None) -> InlineKeyboardMarkup:
+    prefix = "aur" if owner_id is not None else "myreports"
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            text="⬅️ صفحه قبل",
+            callback_data=f"{prefix}_{page - 1}" + (f"_{owner_id}" if owner_id else ""),
+            style=ButtonStyle.PRIMARY,
+        ))
+    nav.append(InlineKeyboardButton(text=f"📄 {page + 1}/{max(total_pages, 1)}", callback_data="noop", style=ButtonStyle.PRIMARY))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(
+            text="صفحه بعد ➡️",
+            callback_data=f"{prefix}_{page + 1}" + (f"_{owner_id}" if owner_id else ""),
+            style=ButtonStyle.PRIMARY,
+        ))
+    rows = [nav]
+    rows.append([InlineKeyboardButton(
+        text="🔙 بازگشت",
+        callback_data="back_menu" if owner_id is None else f"admin_user_{owner_id}",
+        style=ButtonStyle.PRIMARY,
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_user_detail(owner_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(
-                text="🔍 دریافت شناسه با یوزرنیم/آیدی",
-                callback_data="get_by_username",
-                style=ButtonStyle.DANGER,
-            )
+            InlineKeyboardButton(text="📋 گزارش‌های این کاربر", callback_data=f"aur_0_{owner_id}", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="💎 اعطای اشتراک", callback_data=f"admin_gift_{owner_id}", style=ButtonStyle.SUCCESS),
         ],
         [
-            InlineKeyboardButton(
-                text="✍️ وارد کردن شناسه دستی",
-                callback_data="enter_guid",
-                style=ButtonStyle.PRIMARY,
-            )
+            InlineKeyboardButton(text="🗑 حذف اشتراک فعلی", callback_data=f"admin_clear_sub_{owner_id}", style=ButtonStyle.DANGER),
         ],
         [
-            InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_menu", style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton(text="🔙 بازگشت به لیست", callback_data="admin_users_0", style=ButtonStyle.PRIMARY),
         ],
     ])
 
 
+def kb_admin_users(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_users_{page - 1}", style=ButtonStyle.PRIMARY))
+    nav.append(InlineKeyboardButton(text=f"📄 {page + 1}/{max(total_pages, 1)}", callback_data="noop", style=ButtonStyle.PRIMARY))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_users_{page + 1}", style=ButtonStyle.PRIMARY))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        nav,
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_panel", style=ButtonStyle.PRIMARY)],
+    ])
+
+
+def kb_admin_logs(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_logs_{page - 1}", style=ButtonStyle.PRIMARY))
+    nav.append(InlineKeyboardButton(text=f"📄 {page + 1}/{max(total_pages, 1)}", callback_data="noop", style=ButtonStyle.PRIMARY))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_logs_{page + 1}", style=ButtonStyle.PRIMARY))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        nav,
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_panel", style=ButtonStyle.PRIMARY)],
+    ])
+
+
+def kb_admin_live() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="admin_live", style=ButtonStyle.SUCCESS)],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_panel", style=ButtonStyle.PRIMARY)],
+    ])
+
+
+def kb_cancel_admin_flow() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 انصراف", callback_data="admin_panel", style=ButtonStyle.DANGER)],
+    ])
+
+
+# ────────────────────────────────────────────────────────────────────────
+#  Resolve GUID
+# ────────────────────────────────────────────────────────────────────────
 async def resolve_object_guid(session_path: str, text: str) -> Optional[str]:
-    """متن را می‌گیرد: اگر خودش شناسه باشد برمی‌گرداند، وگرنه با یوزرنیم حل می‌کند."""
     text = text.strip().lstrip("@").strip()
     if looks_like_guid(text):
         return text
@@ -445,17 +784,13 @@ async def resolve_object_guid(session_path: str, text: str) -> Optional[str]:
         client = RubikaClient(name=session_path)
         async with client:
             result = await client.get_object_by_username(text)
-            # فقط مقداری که واقعاً شکل شناسه روبیکا دارد را برگردان
-            # اولویت با object_guid (یوزرنیم نیست)، بعد user_guid
             for attr in ("object_guid", "user_guid", "guid", "group_guid", "channel_guid"):
                 val = getattr(result, attr, None)
                 if val and looks_like_guid(val):
                     return val
-            # اگر result شیء تودرتو یا دیکشنری باشد، جستجوی عمقی انجام بده
             found = _search_guid_in(result)
             if found:
                 return found
-            logger.error("resolve_object_guid: هیچ شناسه معتبری در پاسخ پیدا نشد: %s", result)
             return None
     except Exception as exc:
         logger.error("resolve_object_guid: %s", exc)
@@ -463,7 +798,6 @@ async def resolve_object_guid(session_path: str, text: str) -> Optional[str]:
 
 
 def _search_guid_in(obj, _seen: set | None = None) -> Optional[str]:
-    """جستجوی بازگشتی برای اولین مقدار شبیه شناسه در پاسخ rubpy."""
     if _seen is None:
         _seen = set()
     if obj is None or isinstance(obj, (int, float, bool)):
@@ -495,6 +829,10 @@ def _search_guid_in(obj, _seen: set | None = None) -> Optional[str]:
             if r:
                 return r
     return None
+
+
+# ────────────────────────────────────────────────────────────────────────
+#  Start
 # ────────────────────────────────────────────────────────────────────────
 async def cmd_start(message: Message, command: CommandStart, state: FSMContext) -> None:
     bot = message.bot
@@ -521,7 +859,7 @@ async def cmd_start(message: Message, command: CommandStart, state: FSMContext) 
 
     user = get_user(tg_id)
     if user and user.get("rubika_session") and session_exists(user["rubika_session"]):
-        premium = is_premium_active(user)
+        premium = is_premium_active(user) or is_custom_active(user)
         await message.answer("👋 خوش برگشتی!", reply_markup=kb_main(premium))
         await state.set_state(Form.main_menu)
         return
@@ -537,14 +875,11 @@ async def receive_phone(message: Message, state: FSMContext) -> None:
     if message.contact:
         phone_raw = message.contact.phone_number
     else:
-        phone_raw = message.text.strip()
+        phone_raw = (message.text or "").strip()
 
     normalized = _normalize_phone(phone_raw)
     if not normalized:
-        await message.answer(
-            "❌ شماره نامعتبر.\nیک شماره معتبر ایرانی وارد کنید.",
-            reply_markup=kb_phone(),
-        )
+        await message.answer("❌ شماره نامعتبر.\nیک شماره معتبر ایرانی وارد کنید.", reply_markup=kb_phone())
         return
 
     await state.update_data(phone=normalized)
@@ -559,19 +894,16 @@ async def receive_phone(message: Message, state: FSMContext) -> None:
             await state.update_data(needs_password=True)
             await message.answer(
                 "🔑 این حساب رمز دو مرحله‌ای دارد.\n"
-                f"راهنمایی: {hint}\n\n"
-                "لطفاً رمز عبور را وارد کنید:"
+                f"راهنمایی: {hint}\n\nلطفاً رمز عبور را وارد کنید:"
             )
             await state.set_state(Form.password)
             return
 
         await state.update_data(needs_password=False)
         await message.answer(
-            "✅ کد تایید ارسال شد!\n"
-            "کد ۶ رقمی را از پیامک روبیکا بخوانید و اینجا بفرستید:"
+            "✅ کد تایید ارسال شد!\nکد ۶ رقمی را از پیامک روبیکا بخوانید و اینجا بفرستید:"
         )
         await state.set_state(Form.code)
-
     except Exception as exc:
         logger.error("send_code: %s", exc)
         await message.answer(f"❌ {exc}\nبا /start دوباره تلاش کن.")
@@ -579,28 +911,22 @@ async def receive_phone(message: Message, state: FSMContext) -> None:
 
 
 async def receive_password(message: Message, state: FSMContext) -> None:
-    password = message.text.strip() if message.text else ""
+    password = (message.text or "").strip()
     data = await state.get_data()
     phone = data.get("phone", "")
-
     if not password:
         await message.answer("❌ رمز نمی‌تواند خالی باشد. دوباره:")
         return
-
     await message.answer("⏳ بررسی رمز عبور...")
-
     try:
         result = await rubika_send_code(phone, pass_key=password)
         await state.update_data(phone_code_hash=result["phone_code_hash"])
-
         if result.get("status") == "SendPassKey":
             hint = result.get("hint_pass_key", "ندارد")
             await message.answer(f"❌ رمز اشتباه است. راهنمایی: {hint}\nدوباره:")
             return
-
         await message.answer("✅ رمز تایید شد!\nکد ۶ رقمی را از پیامک بفرستید:")
         await state.set_state(Form.code)
-
     except Exception as exc:
         logger.error("send_code passkey: %s", exc)
         await message.answer(f"❌ {exc}")
@@ -618,10 +944,8 @@ async def receive_code(message: Message, state: FSMContext) -> None:
         return
 
     await message.answer("⏳ در حال ورود...")
-
     try:
         login_data = await rubika_sign_in(phone, code_digits, phone_code_hash)
-
         upsert_user(
             tg_id,
             phone=phone,
@@ -641,7 +965,8 @@ async def receive_code(message: Message, state: FSMContext) -> None:
                     new_until = current_until + timedelta(hours=1)
                 else:
                     new_until = now + timedelta(hours=1)
-                upsert_user(referrer_id, is_premium=1, premium_until=new_until.isoformat())
+                upsert_user(referrer_id, is_premium=1, premium_until=new_until.isoformat(),
+                            subscription_source="prize")
                 try:
                     await message.bot.send_message(
                         chat_id=referrer_id,
@@ -658,7 +983,6 @@ async def receive_code(message: Message, state: FSMContext) -> None:
         await asyncio.sleep(0.5)
         await message.answer("✅ ورود موفق!", reply_markup=kb_main(False))
         await state.set_state(Form.main_menu)
-
     except Exception as exc:
         logger.error("sign_in: %s", exc)
         await message.answer(f"❌ {exc}")
@@ -671,7 +995,6 @@ async def check_join_callback(callback: CallbackQuery, state: FSMContext) -> Non
     await callback.answer()
     bot = callback.bot
     tg_id = callback.from_user.id
-
     is_member = await check_user_membership(bot, tg_id)
     if not is_member:
         await callback.message.answer(
@@ -680,41 +1003,104 @@ async def check_join_callback(callback: CallbackQuery, state: FSMContext) -> Non
             reply_markup=kb_force_join(),
         )
         return
-
     user = get_user(tg_id)
     if user and user.get("rubika_session") and session_exists(user["rubika_session"]):
-        premium = is_premium_active(user)
+        premium = is_premium_active(user) or is_custom_active(user)
         await callback.message.answer("✅ عضویت تایید شد! 👋", reply_markup=kb_main(premium))
         await state.set_state(Form.main_menu)
         return
-
-    await callback.message.answer(
-        "✅ عضویت تایید شد!\n\n📱 شماره روبیکا را بفرست:",
-        reply_markup=kb_phone(),
-    )
+    await callback.message.answer("✅ عضویت تایید شد!\n\n📱 شماره روبیکا را بفرست:", reply_markup=kb_phone())
     await state.set_state(Form.phone)
 
 
 async def back_to_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     tg_id = callback.from_user.id
-    user  = get_user(tg_id)
-    premium = is_premium_active(user) if user else False
+    user = get_user(tg_id)
+    premium = (is_premium_active(user) or is_custom_active(user)) if user else False
     await callback.message.answer("🏠 منو:", reply_markup=kb_main(premium))
     await state.set_state(Form.main_menu)
 
 
-async def process_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    data  = callback.data
+async def show_my_reports(callback: CallbackQuery, page: int = 0) -> None:
     tg_id = callback.from_user.id
-    bot  = callback.bot
+    targets = get_user_unique_targets(tg_id)
+    per_page = 5
+    total_pages = max((len(targets) + per_page - 1) // per_page, 1)
+    page = max(0, min(page, total_pages - 1))
+
+    if not targets:
+        text = "📋 هنوز هیچ گزارشی ثبت نکرده‌اید."
+    else:
+        chunk = targets[page * per_page:(page + 1) * per_page]
+        lines = [f"📋 گزارش‌های شما (صفحه {page + 1}/{total_pages})\n"]
+        for i, t in enumerate(chunk, 1):
+            guid = t["target_guid"] or "—"
+            uname = t["target_username"] or ""
+            ttype = TARGET_TYPE_FA.get(t.get("target_type", "unknown"), "نامشخص")
+            count = t.get("total_count", 0)
+            last = (t.get("last_report") or "")[:16]
+            suspended = t.get("suspended", 0)
+            badge = "🚫 تعلیق شده" if suspended else "🟢 فعال"
+            short_guid = guid if len(guid) <= 22 else guid[:20] + "…"
+            header = f"{i}. {badge} | {ttype}"
+            sub = f"   🆔 <code>{short_guid}</code>"
+            if uname:
+                sub += f" | @{uname}"
+            sub += f"\n   📅 آخرین: {last} | 📊 {count} گزارش"
+            lines.append(header + "\n" + sub)
+        text = "\n".join(lines)
+
+    markup = kb_user_reports(page, total_pages)
+    try:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+async def refresh_statuses(callback: CallbackQuery) -> None:
+    tg_id = callback.from_user.id
     user = get_user(tg_id)
-    logger.warning("CALLBACK data=%s from=%s state=%s has_user=%s",
-                   data, tg_id, await state.get_state(), bool(user))
+    if not user or not session_exists(user.get("rubika_session")):
+        await callback.message.answer("❌ سشن معتبر نیست.", reply_markup=kb_menu_return())
+        return
+    await callback.message.edit_text("⏳ در حال بررسی وضعیت اهداف...")
+    targets = get_user_unique_targets(tg_id)
+    for t in targets[:20]:
+        suspended = await check_suspension_via_rubpy(user["rubika_session"], t["target_guid"])
+        if suspended is not None:
+            mark_target_suspended(tg_id, t["target_guid"], suspended)
+    await show_my_reports(callback, page=0)
+
+
+async def process_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    data = callback.data
+    tg_id = callback.from_user.id
+    bot = callback.bot
+    user = get_user(tg_id)
+
+    if data == "noop":
+        await callback.answer()
+        return
+
+    if data.startswith("myreports_"):
+        try:
+            page = int(data.split("_")[1])
+        except (ValueError, IndexError):
+            page = 0
+        await callback.answer()
+        await show_my_reports(callback, page)
+        return
+
+    if data == "refresh_statuses":
+        await callback.answer()
+        await refresh_statuses(callback)
+        return
+
+    await callback.answer()
 
     if data == "back_menu":
-        premium = is_premium_active(user) if user else False
+        premium = (is_premium_active(user) or is_custom_active(user)) if user else False
         await callback.message.answer("🏠 منو:", reply_markup=kb_main(premium))
         await state.set_state(Form.main_menu)
         return
@@ -759,26 +1145,37 @@ async def process_callback(callback: CallbackQuery, state: FSMContext) -> None:
         if not user:
             await callback.message.answer("ابتدا /start بزن.")
             return
-        premium = is_premium_active(user)
-        limit   = PREMIUM_LIMIT if premium else FREE_LIMIT
-        plan    = "👑 اشتراکی" if premium else "🆓 رایگان"
+        limit = get_effective_limit(user)
+        plan_parts = []
+        if is_custom_active(user):
+            plan_parts.append(f"💎 سفارشی ({user.get('custom_quota')} گزارش/نوع تا {str(user.get('custom_expiry'))[:16]})")
+        if is_premium_active(user):
+            plan_parts.append(f"👑 پریمیوم تا {user.get('premium_until', '')[:16]}")
+        if not plan_parts:
+            plan_parts.append("🆓 رایگان")
+        plan = " + ".join(plan_parts)
+        tg_targets = count_user_targets(tg_id)
         await callback.message.answer(
             f"📊 وضعیت حساب\n\n"
             f"پلن: {plan}\n"
-            f"محدودیت: {limit} از هر نوع\n"
-            f"📊 گزارشات: {user.get('total_reports', 0)}\n"
-            f"📱 شماره: {user.get('phone', '-')}",
+            f"محدودیت هر نوع: {limit} گزارش\n"
+            f"📊 کل گزارش‌ها: {user.get('total_reports', 0)}\n"
+            f"🎯 اهداف یکتا: {tg_targets}\n"
+            f"👥 دعوت‌ها: {user.get('total_invites', 0)}\n"
+            f"🔐 سشن: {'فعال' if session_exists(user.get('rubika_session')) else 'نامعتبر'}",
             reply_markup=kb_menu_return(),
         )
         return
 
     if data == "subscription":
-        premium = is_premium_active(user) if user else False
+        premium = (is_premium_active(user) or is_custom_active(user)) if user else False
         if premium:
-            await callback.message.answer(
-                f"👑 اشتراک تا {user['premium_until'][:10]} فعال است.",
-                reply_markup=kb_menu_return(),
-            )
+            txt = "💎 اشتراک‌های فعال شما:\n\n"
+            if is_custom_active(user):
+                txt += f"• سفارشی: {user.get('custom_quota')} گزارش/نوع تا {str(user.get('custom_expiry'))[:16]}\n"
+            if is_premium_active(user):
+                txt += f"• پریمیوم: تا {user.get('premium_until', '')[:16]}\n"
+            await callback.message.answer(txt, reply_markup=kb_menu_return())
         else:
             await callback.message.answer(
                 f"💎 خرید اشتراک یک ماهه\n"
@@ -801,7 +1198,8 @@ async def process_callback(callback: CallbackQuery, state: FSMContext) -> None:
             "5. تعداد اکانت‌های ربات برای گزارش را بگو\n"
             "6. گزارش‌ها با همه اکانت‌ها خودکار ارسال می‌شوند\n\n"
             f"🆓 رایگان: {FREE_LIMIT} گزارش\n"
-            f"💎 اشتراکی: {PREMIUM_LIMIT} گزارش\n\n"
+            f"💎 پریمیوم: {PREMIUM_LIMIT} گزارش\n"
+            "💎 اشتراک سفارشی: طبق تنظیم ادمین\n\n"
             "برای توقف /stop",
             reply_markup=kb_menu_return(),
         )
@@ -812,15 +1210,11 @@ async def process_callback(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.message.answer("ابتدا /start بزن.")
             return
         bot_info = await bot.get_me()
-        bot_username = bot_info.username
-        ref_link = f"https://t.me/{bot_username}?start=ref_{tg_id}"
-        invites = user.get("total_invites", 0)
+        ref_link = f"https://t.me/{bot_info.username}?start=ref_{tg_id}"
         await callback.message.answer(
-            f"🔗 لینک دعوت شما\n\n"
-            f"📱 لینک:\n{ref_link}\n\n"
-            f"👥 تعداد دعوت‌ها: {invites}\n\n"
-            f"🎁 به ازای هر نفری که با لینک شما عضو شود\n"
-            f"   ۱ ساعت اشتراک رایگان دریافت می‌کنید!",
+            f"🔗 لینک دعوت شما\n\n📱 لینک:\n{ref_link}\n\n"
+            f"👥 تعداد دعوت‌ها: {user.get('total_invites', 0)}\n\n"
+            f"🎁 به ازای هر نفری که با لینک شما عضو شود ۱ ساعت اشتراک رایگان دریافت می‌کنید!",
             reply_markup=kb_menu_return(),
         )
         return
@@ -836,133 +1230,110 @@ async def process_callback(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if data == "daily_reward":
-        if not user:
-            await callback.message.answer("ابتدا /start بزن.")
-            return
-
-        last_reward = user.get("last_daily_reward")
-        now = datetime.now()
-
-        if last_reward:
-            try:
-                last_dt = datetime.fromisoformat(last_reward)
-                diff = now - last_dt
-                if diff < timedelta(hours=24):
-                    remaining = timedelta(hours=24) - diff
-                    hours = remaining.seconds // 3600
-                    minutes = (remaining.seconds % 3600) // 60
-                    await callback.message.answer(
-                        f"⏳ جایزه بعدی در {hours} ساعت و {minutes} دقیقه",
-                        reply_markup=kb_menu_return(),
-                    )
-                    return
-            except (ValueError, TypeError):
-                pass
-
-        dice_msg = await callback.message.answer("🎲")
-        await asyncio.sleep(0.5)
-        await dice_msg.edit_text("🎲 .")
-        await asyncio.sleep(0.5)
-        await dice_msg.edit_text("🎲 ..")
-        await asyncio.sleep(0.5)
-        await dice_msg.edit_text("🎲 ...")
-        await asyncio.sleep(1)
-
-        roll = random.randint(1, 6)
-
-        if roll == 6:
-            prize_days = 3
-            prize_text = "🏆 شماره ۶! اشتراک ۳ روزه پرو برنده شدید!"
-            emoji = "🏆"
-        elif roll in (4, 5):
-            prize_days = 1
-            prize_text = "🎉 شماره ۴ یا ۵! اشتراک ۱ روزه پرو برنده شدید!"
-            emoji = "🎉"
-        else:
-            prize_days = 0
-            prize_text = f"😔 شماره {roll} آمد. برنده نشدید!"
-            emoji = "😔"
-
-        upsert_user(tg_id, last_daily_reward=now.isoformat())
-
-        result_text = (
-            f"{emoji} نتیجه تاس:\n\n"
-            f"🎲 ━━━━━━━━━━━━━━━━ 🎲\n"
-            f"       [ {roll} ]\n"
-            f"🎲 ━━━━━━━━━━━━━━━━ 🎲\n\n"
-            f"{prize_text}"
-        )
-
-        if prize_days > 0:
-            if is_premium_active(user):
-                current_until = datetime.fromisoformat(user["premium_until"])
-                new_until = current_until + timedelta(days=prize_days)
-            else:
-                new_until = now + timedelta(days=prize_days)
-            until = new_until.isoformat()
-            upsert_user(tg_id, is_premium=1, premium_until=until)
-
-            user = get_user(tg_id)
-            premium = is_premium_active(user) if user else False
-
-            result_text += (
-                f"\n\n👑 اشتراک تا {until[:10]} فعال است.\n"
-                f"📊 محدودیت: {PREMIUM_LIMIT} گزارش در هر نوع"
-            )
-            await dice_msg.edit_text(result_text, reply_markup=kb_main(premium))
-        else:
-            result_text += "\n\n💡 فردا دوباره امتحان کنید!"
-            await dice_msg.edit_text(result_text, reply_markup=kb_menu_return())
+        await handle_daily_reward(callback, user, tg_id)
         return
 
     if data.startswith("rt_"):
-        key = data[3:]
-
-        if key == "confirm":
-            state_data = await state.get_data()
-            selected: set = state_data.get("selected_types", set())
-            if not selected:
-                await callback.answer("حداقل یک نوع انتخاب کن.", show_alert=True)
-                return
-
-            if "7" in selected:
-                await callback.message.answer("متن گزارش «سایر» را بنویس:", reply_markup=kb_menu_return())
-                await state.set_state(Form.report_other_text)
-                return
-
-            premium = is_premium_active(user) if user else False
-            limit   = PREMIUM_LIMIT if premium else FREE_LIMIT
-            labels  = [REPORT_TYPES_MAP[k][0] for k in selected]
-            await callback.message.answer(
-                f"انتخاب: {', '.join(labels)}\n"
-                f"چند گزارش از هر نوع؟ (حداکثر {limit})",
-                reply_markup=kb_menu_return(),
-            )
-            await state.set_state(Form.report_count)
-            return
-
-        state_data = await state.get_data()
-        selected: set = state_data.get("selected_types", set())
-        if key in selected:
-            selected.discard(key)
-        else:
-            selected.add(key)
-        await state.update_data(selected_types=selected)
-        await callback.message.edit_reply_markup(reply_markup=kb_report_types(selected))
+        await handle_report_type_callback(callback, state, data, user)
         return
 
 
-async def receive_guid(message: Message, state: FSMContext) -> None:
-    guid = message.text.strip()
-    tg_id = message.from_user.id
+async def handle_daily_reward(callback: CallbackQuery, user: dict | None, tg_id: int) -> None:
+    if not user:
+        await callback.message.answer("ابتدا /start بزن.")
+        return
+    last_reward = user.get("last_daily_reward")
+    now = datetime.now()
+    if last_reward:
+        try:
+            last_dt = datetime.fromisoformat(last_reward)
+            diff = now - last_dt
+            if diff < timedelta(hours=24):
+                remaining = timedelta(hours=24) - diff
+                hours = remaining.seconds // 3600
+                minutes = (remaining.seconds % 3600) // 60
+                await callback.message.answer(
+                    f"⏳ جایزه بعدی در {hours} ساعت و {minutes} دقیقه",
+                    reply_markup=kb_menu_return(),
+                )
+                return
+        except (ValueError, TypeError):
+            pass
 
+    dice_msg = await callback.message.answer("🎲")
+    for dots in [".", "..", "..."]:
+        await asyncio.sleep(0.5)
+        await dice_msg.edit_text(f"🎲 {dots}")
+    await asyncio.sleep(1)
+
+    roll = random.randint(1, 6)
+    if roll == 6:
+        prize_days, prize_text, emoji = 3, "🏆 شماره ۶! اشتراک ۳ روزه برنده شدید!", "🏆"
+    elif roll in (4, 5):
+        prize_days, prize_text, emoji = 1, "🎉 اشتراک ۱ روزه برنده شدید!", "🎉"
+    else:
+        prize_days, prize_text, emoji = 0, f"😔 شماره {roll} آمد. برنده نشدید!", "😔"
+
+    upsert_user(tg_id, last_daily_reward=now.isoformat())
+    result_text = (
+        f"{emoji} نتیجه تاس:\n\n"
+        f"🎲 ━━━━━━━━━━━━━━━━ 🎲\n       [ {roll} ]\n🎲 ━━━━━━━━━━━━━━━━ 🎲\n\n"
+        f"{prize_text}"
+    )
+    if prize_days > 0:
+        if is_premium_active(user):
+            new_until = datetime.fromisoformat(user["premium_until"]) + timedelta(days=prize_days)
+        else:
+            new_until = now + timedelta(days=prize_days)
+        upsert_user(tg_id, is_premium=1, premium_until=new_until.isoformat(),
+                    subscription_source="daily_prize")
+        result_text += f"\n\n👑 اشتراک تا {new_until.isoformat()[:10]} فعال است."
+        await dice_msg.edit_text(result_text, reply_markup=kb_main(True))
+    else:
+        result_text += "\n\n💡 فردا دوباره امتحان کنید!"
+        await dice_msg.edit_text(result_text, reply_markup=kb_menu_return())
+
+
+async def handle_report_type_callback(callback: CallbackQuery, state: FSMContext, data: str, user: dict | None) -> None:
+    key = data[3:]
+    if key == "confirm":
+        state_data = await state.get_data()
+        selected: set = state_data.get("selected_types", set())
+        if not selected:
+            await callback.answer("حداقل یک نوع انتخاب کن.", show_alert=True)
+            return
+        if "7" in selected:
+            await callback.message.answer("متن گزارش «سایر» را بنویس:", reply_markup=kb_menu_return())
+            await state.set_state(Form.report_other_text)
+            return
+        limit = get_effective_limit(user)
+        labels = [REPORT_TYPES_MAP[k][0] for k in selected]
+        await callback.message.answer(
+            f"انتخاب: {', '.join(labels)}\nچند گزارش از هر نوع؟ (حداکثر {limit})",
+            reply_markup=kb_menu_return(),
+        )
+        await state.set_state(Form.report_count)
+        return
+
+    state_data = await state.get_data()
+    selected: set = state_data.get("selected_types", set())
+    if key in selected:
+        selected.discard(key)
+    else:
+        selected.add(key)
+    await state.update_data(selected_types=selected)
+    await callback.message.edit_reply_markup(reply_markup=kb_report_types(selected))
+
+
+async def receive_guid(message: Message, state: FSMContext) -> None:
+    guid = (message.text or "").strip()
+    tg_id = message.from_user.id
     if looks_like_guid(guid):
         await state.update_data(object_guid=guid, selected_types=set())
         await message.answer("نوع گزارش را انتخاب کن:", reply_markup=kb_report_types(set()))
         await state.set_state(Form.report_types)
         return
 
-    # اگر کاربر یوزرنیم/آیدی داد، مثل مسیر «دریافت با یوزرنیم» حلش می‌کنیم
     user = get_user(tg_id)
     if not user or not user.get("rubika_session") or not session_exists(user["rubika_session"]):
         await message.answer("❌ سشن معتبر نیست. /start بزن.", reply_markup=kb_menu_return())
@@ -972,13 +1343,9 @@ async def receive_guid(message: Message, state: FSMContext) -> None:
     await message.answer("⏳ در حال جستجوی شناسه...")
     resolved = await resolve_object_guid(user["rubika_session"], guid)
     if not resolved:
-        await message.answer(
-            "❌ شناسه‌ای برای این یوزرنیم/آیدی پیدا نشد.",
-            reply_markup=kb_menu_return(),
-        )
+        await message.answer("❌ شناسه‌ای برای این یوزرنیم/آیدی پیدا نشد.", reply_markup=kb_menu_return())
         await state.set_state(Form.main_menu)
         return
-
     await state.update_data(object_guid=resolved, selected_types=set())
     await message.answer(
         f"✅ شناسه پیدا شد:\n<code>{resolved}</code>\n\nنوع گزارش را انتخاب کن:",
@@ -989,24 +1356,20 @@ async def receive_guid(message: Message, state: FSMContext) -> None:
 
 
 async def receive_resolve(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
+    text = (message.text or "").strip()
     tg_id = message.from_user.id
     user = get_user(tg_id)
-
     if not user or not user.get("rubika_session"):
         await message.answer("❌ سشن معتبر نیست. /start بزن.", reply_markup=kb_menu_return())
         await state.set_state(Form.main_menu)
         return
-
     session_path = user["rubika_session"]
     if not session_exists(session_path):
         await message.answer("❌ سشن منقضی شده. /start بزن.", reply_markup=kb_menu_return())
         upsert_user(tg_id, rubika_session=None, rubika_auth=None, rubika_private_key=None)
         await state.set_state(Form.main_menu)
         return
-
     await message.answer("⏳ در حال جستجوی شناسه...")
-
     guid = await resolve_object_guid(session_path, text)
     if not guid:
         await message.answer(
@@ -1016,7 +1379,6 @@ async def receive_resolve(message: Message, state: FSMContext) -> None:
         )
         await state.set_state(Form.report_guid)
         return
-
     await state.update_data(object_guid=guid, selected_types=set())
     await message.answer(
         f"✅ شناسه پیدا شد:\n<code>{guid}</code>\n\nنوع گزارش را انتخاب کن:",
@@ -1027,21 +1389,17 @@ async def receive_resolve(message: Message, state: FSMContext) -> None:
 
 
 async def receive_other_text(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
+    text = (message.text or "").strip()
     tg_id = message.from_user.id
     user = get_user(tg_id)
-
     if not text or len(text) < 3:
         await message.answer("❌ حداقل ۳ کاراکتر بنویس.", reply_markup=kb_menu_return())
         return
-
     await state.update_data(other_report_text=text)
     state_data = await state.get_data()
-    premium = is_premium_active(user) if user else False
-    limit   = PREMIUM_LIMIT if premium else FREE_LIMIT
+    limit = get_effective_limit(user)
     selected: set = state_data.get("selected_types", set())
     labels = [REPORT_TYPES_MAP[k][0] for k in selected]
-
     await message.answer(
         f"انتخاب: {', '.join(labels)}\nچند گزارش از هر نوع؟ (حداکثر {limit})",
         reply_markup=kb_menu_return(),
@@ -1050,55 +1408,37 @@ async def receive_other_text(message: Message, state: FSMContext) -> None:
 
 
 async def receive_count(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
+    text = (message.text or "").strip()
     tg_id = message.from_user.id
     user = get_user(tg_id)
-
     if not text.isdigit() or int(text) < 1:
         await message.answer("❌ عدد مثبت وارد کن.", reply_markup=kb_menu_return())
         return
-
     count = int(text)
-    premium = is_premium_active(user) if user else False
-    limit   = PREMIUM_LIMIT if premium else FREE_LIMIT
-
+    limit = get_effective_limit(user)
     if count > limit:
         msg = f"❌ محدودیت پلن: {limit} گزارش."
-        if not premium:
+        if not (is_premium_active(user) or is_custom_active(user)):
             msg += f"\n💎 اشتراک: {ADMIN_USERNAME}"
         await message.answer(msg + "\nعدد کمتر:", reply_markup=kb_menu_return())
         return
-
     await state.update_data(count=count)
-    await message.answer(
-        "⏱️ هر چند ثانیه یک گزارش ارسال شود؟\nمثال: ۳",
-        reply_markup=kb_menu_return(),
-    )
+    await message.answer("⏱️ هر چند ثانیه یک گزارش ارسال شود؟\nمثال: ۳", reply_markup=kb_menu_return())
     await state.set_state(Form.report_delay)
-    return
 
 
 async def receive_delay(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
-    tg_id = message.from_user.id
-    user = get_user(tg_id)
-
+    text = (message.text or "").strip()
     if not text.isdigit() or int(text) < 1:
         await message.answer("❌ عدد مثبت (ثانیه) وارد کن.", reply_markup=kb_menu_return())
         return
-
     delay = int(text)
     all_sessions = get_all_valid_sessions()
     total = len(all_sessions)
-
     if total == 0:
-        await message.answer(
-            "❌ هیچ اکانتی در ربات ثبت نشده. ابتدا حداقل یک حساب روبیکا اضافه کن.",
-            reply_markup=kb_menu_return(),
-        )
+        await message.answer("❌ هیچ اکانتی در ربات ثبت نشده.", reply_markup=kb_menu_return())
         await state.set_state(Form.main_menu)
         return
-
     await state.update_data(report_delay_delay=delay)
     await message.answer(
         f"👥 تعداد کل اکانت‌های ثبت‌شده در ربات: {total}\n"
@@ -1106,34 +1446,24 @@ async def receive_delay(message: Message, state: FSMContext) -> None:
         reply_markup=kb_menu_return(),
     )
     await state.set_state(Form.report_accounts)
-    return
 
 
 async def receive_accounts(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
+    text = (message.text or "").strip()
     tg_id = message.from_user.id
     user = get_user(tg_id)
-
     if not text.isdigit() or int(text) < 1:
         await message.answer("❌ عدد مثبت وارد کن.", reply_markup=kb_menu_return())
         return
-
     all_sessions = get_all_valid_sessions()
     total = len(all_sessions)
     if total == 0:
-        await message.answer(
-            "❌ هیچ اکانتی در ربات ثبت نشده. ابتدا حداقل یک حساب روبیکا اضافه کن.",
-            reply_markup=kb_menu_return(),
-        )
+        await message.answer("❌ هیچ اکانتی ثبت نشده.", reply_markup=kb_menu_return())
         await state.set_state(Form.main_menu)
         return
-
     num_accounts = int(text)
     if num_accounts > total:
-        await message.answer(
-            f"❌ فقط {total} اکانت در ربات موجود است. عدد کمتر:",
-            reply_markup=kb_menu_return(),
-        )
+        await message.answer(f"❌ فقط {total} اکانت موجود است. عدد کمتر:", reply_markup=kb_menu_return())
         return
 
     state_data = await state.get_data()
@@ -1147,27 +1477,21 @@ async def receive_accounts(message: Message, state: FSMContext) -> None:
         await message.answer("❌ حداقل یک نوع گزارش انتخاب کن.", reply_markup=kb_menu_return())
         await state.set_state(Form.main_menu)
         return
-
     if not object_guid:
-        await message.answer("❌ شناسه کاربر یافت نشد. /start بزن.", reply_markup=kb_menu_return())
+        await message.answer("❌ شناسه کاربر یافت نشد.", reply_markup=kb_menu_return())
         await state.set_state(Form.main_menu)
         return
 
     session_paths = all_sessions[:num_accounts]
-
     selected_types = [
         (REPORT_TYPES_MAP[k][0], REPORT_TYPES_MAP[k][1], other_text if k == "7" else "")
         for k in selected
     ]
-
     await state.update_data(object_guid=None, selected_types=None, other_report_text=None,
                             count=None, report_delay_delay=None)
-
     await message.answer(
-        f"🚀 ارسال {count} گزارش (هر {delay} ثانیه) با {num_accounts} اکانت...\n"
-        f"⛔ /stop برای توقف"
+        f"🚀 ارسال {count} گزارش (هر {delay} ثانیه) با {num_accounts} اکانت...\n⛔ /stop برای توقف"
     )
-
     asyncio.create_task(
         _pipeline(
             tg_id=tg_id,
@@ -1180,7 +1504,6 @@ async def receive_accounts(message: Message, state: FSMContext) -> None:
         )
     )
     await state.set_state(Form.main_menu)
-    return
 
 
 async def cmd_stop(message: Message) -> None:
@@ -1188,29 +1511,18 @@ async def cmd_stop(message: Message) -> None:
     await message.answer("⛔ توقف")
 
 
-# ────────────────────────────────────────────────────────────────────────
-#  Subscription / Card Number
-# ────────────────────────────────────────────────────────────────────────
 async def receive_receipt(message: Message, state: FSMContext) -> None:
     tg_id = message.from_user.id
-    user = get_user(tg_id)
-
     if not message.photo:
-        await message.answer(
-            "❌ لطفاً عکس رسید پرداخت (فیش واریز) را بفرستید.",
-            reply_markup=kb_menu_return(),
-        )
+        await message.answer("❌ لطفاً عکس رسید پرداخت را بفرستید.", reply_markup=kb_menu_return())
         return
-
     photo = message.photo[-1]
-
     approve_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ تایید", callback_data=f"approve_sub_{tg_id}", style=ButtonStyle.SUCCESS),
             InlineKeyboardButton(text="❌ رد", callback_data=f"reject_sub_{tg_id}", style=ButtonStyle.DANGER),
         ]
     ])
-
     for admin_id in ADMIN_IDS:
         try:
             await message.bot.send_photo(
@@ -1218,7 +1530,6 @@ async def receive_receipt(message: Message, state: FSMContext) -> None:
                 photo=photo.file_id,
                 caption=(
                     f"💎 رسید پرداخت اشتراک\n\n"
-                    f"👤 کاربر: {user.get('phone', '-')}\n"
                     f"🆔 تلگرام: {tg_id}\n"
                     f"💰 مبلغ: {PREMIUM_PRICE}\n"
                     f"⏰ تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
@@ -1227,57 +1538,57 @@ async def receive_receipt(message: Message, state: FSMContext) -> None:
             )
         except Exception as exc:
             logger.error("Failed to send receipt to admin %d: %s", admin_id, exc)
-
     await message.answer(
-        "✅ رسید شما برای ادمین ارسال شد!\n\n"
-        f"💰 مبلغ: {PREMIUM_PRICE}\n\n"
-        "⏳ منتظر تایید ادمین بمانید؛ پس از تایید اشتراک یک ماهه فعال می‌شود.",
+        f"✅ رسید شما برای ادمین ارسال شد!\n\n💰 مبلغ: {PREMIUM_PRICE}\n\n"
+        "⏳ منتظر تایید ادمین بمانید.",
         reply_markup=kb_menu_return(),
     )
     await state.set_state(Form.main_menu)
 
 
 async def admin_approve_sub(callback: CallbackQuery) -> None:
-    await callback.answer()
-
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ فقط ادمین", show_alert=True)
         return
-
+    await callback.answer()
     data = callback.data
     if data.startswith("approve_sub_"):
         target_id = int(data.split("_")[-1])
-        set_premium(target_id, PREMIUM_MONTHS)
-        await callback.message.edit_caption(caption=f"✅ اشتراک فعال شد!\n👤 کاربر: {target_id}", reply_markup=None)
+        set_premium(target_id, PREMIUM_MONTHS, source="purchased")
+        await callback.message.edit_caption(caption=f"✅ اشتراک فعال شد!\n🆔 {target_id}", reply_markup=None)
         try:
             user = get_user(target_id)
             premium_until = user.get("premium_until", "")[:10] if user else ""
             await callback.bot.send_message(
                 chat_id=target_id,
-                text=(
-                    f"🎉 اشتراک شما فعال شد!\n\n"
-                    f"👑 اشتراک تا {premium_until} فعال است.\n"
-                    f"📊 محدودیت: {PREMIUM_LIMIT} گزارش در هر نوع"
-                ),
+                text=f"🎉 اشتراک شما فعال شد!\n👑 اشتراک تا {premium_until}",
             )
         except Exception as exc:
             logger.error("Failed to notify user %d: %s", target_id, exc)
-
     elif data.startswith("reject_sub_"):
         target_id = int(data.split("_")[-1])
-        await callback.message.edit_caption(caption=f"❌ درخواست رد شد.\n👤 کاربر: {target_id}", reply_markup=None)
+        await callback.message.edit_caption(caption=f"❌ درخواست رد شد.\n🆔 {target_id}", reply_markup=None)
         try:
-            await callback.bot.send_message(
-                chat_id=target_id,
-                text="❌ درخواست اشتراک شما توسط ادمین رد شد.\nبرای اطلاعات بیشتر با ادمین تماس بگیرید.",
-            )
+            await callback.bot.send_message(chat_id=target_id, text="❌ درخواست اشتراک شما رد شد.")
         except Exception as exc:
             logger.error("Failed to notify user %d: %s", target_id, exc)
 
 
 # ────────────────────────────────────────────────────────────────────────
-#  Pipeline
+#  Pipeline + Live status
 # ────────────────────────────────────────────────────────────────────────
+async def _reporting_keepalive(bot: Bot, chat_id: int, stop_event: asyncio.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _pipeline(
     tg_id: int,
     session_paths: list[str],
@@ -1288,6 +1599,23 @@ async def _pipeline(
     status_message: Message,
 ) -> None:
     user_stop[tg_id] = False
+    bot = status_message.bot
+    chat_id = status_message.chat.id
+
+    target_type = detect_target_type(object_guid)
+    started_at = datetime.now()
+
+    ACTIVE_REPORTS[tg_id] = {
+        "start": started_at,
+        "target": object_guid,
+        "count": count * len(selected_types),
+        "progress": 0,
+        "types": [t[0] for t in selected_types],
+    }
+    upsert_user(tg_id, is_reporting=1)
+
+    stop_event = asyncio.Event()
+    typing_task = asyncio.create_task(_reporting_keepalive(bot, chat_id, stop_event))
 
     async def reply(msg: str) -> None:
         try:
@@ -1297,46 +1625,91 @@ async def _pipeline(
 
     if not session_paths:
         await reply("❌ هیچ سشن معتبری برای گزارش یافت نشد.")
+        stop_event.set()
+        try:
+            await typing_task
+        except Exception:
+            pass
+        upsert_user(tg_id, is_reporting=0)
+        ACTIVE_REPORTS.pop(tg_id, None)
         return
 
     n = len(session_paths)
-
     total_sent = 0
     lines = []
-    for label, rt_enum, other_text in selected_types:
-        # توزیع تعداد گزارش‌ها بین سشن‌ها
-        per = count // n
-        rem = count % n
-        tasks = []
-        for idx, sp in enumerate(session_paths):
-            c = per + (1 if idx < rem else 0)
-            if c > 0:
-                tasks.append(asyncio.create_task(
-                    _single_loop(sp, object_guid, rt_enum, other_text, c, delay, label, tg_id)
-                ))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        sent = 0
-        failed = 0
-        for r in results:
-            if isinstance(r, Exception):
-                lines.append(f"❌ خطا ({label}): {r}")
-            else:
-                s, f = r
-                sent += s
-                failed += f
-        total_sent += sent
-        lines.append(f"✅ {label}: {sent} ارسال | {failed} ناموفق")
-
-    add_stats(tg_id, total_sent)
-    user    = get_user(tg_id)
-    premium = is_premium_active(user) if user else False
-
-    await reply("📊 گزارش:\n" + "\n".join(lines))
+    overall_suspended = False
 
     try:
-        await status_message.answer("🔵 منو:", reply_markup=kb_main(premium))
-    except Exception:
-        pass
+        for label, rt_enum, other_text in selected_types:
+            per = count // n
+            rem = count % n
+            tasks = []
+            for idx, sp in enumerate(session_paths):
+                c = per + (1 if idx < rem else 0)
+                if c > 0:
+                    tasks.append(asyncio.create_task(
+                        _single_loop(sp, object_guid, rt_enum, other_text, c, delay, label, tg_id)
+                    ))
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            sent = 0
+            failed = 0
+            suspended = False
+            for r in results:
+                if isinstance(r, Exception):
+                    lines.append(f"❌ خطا ({label}): {r}")
+                else:
+                    s, f, susp = r
+                    sent += s
+                    failed += f
+                    if susp:
+                        suspended = True
+            if suspended:
+                overall_suspended = True
+            total_sent += sent
+            lines.append(f"✅ {label}: {sent} ارسال | {failed} ناموفق")
+
+            log_report_run(
+                telegram_id=tg_id,
+                target_guid=object_guid,
+                target_type=target_type,
+                target_username=None,
+                report_type_label=label,
+                count=count,
+                status="sent" if sent > 0 else "failed",
+                is_suspended=suspended,
+            )
+
+            if tg_id in ACTIVE_REPORTS:
+                ACTIVE_REPORTS[tg_id]["progress"] += count
+
+        add_stats(tg_id, total_sent)
+
+        if overall_suspended:
+            mark_target_suspended(tg_id, object_guid, True)
+            lines.append("\n🚫 هدف احتمالاً تعلیق/مسدود شده است.")
+
+        user = get_user(tg_id)
+        premium = (is_premium_active(user) or is_custom_active(user)) if user else False
+        await reply("📊 گزارش:\n" + "\n".join(lines))
+
+        try:
+            await status_message.answer("🏠 منو:", reply_markup=kb_main(premium))
+        except Exception:
+            pass
+
+    finally:
+        stop_event.set()
+        try:
+            await typing_task
+        except Exception:
+            pass
+        upsert_user(tg_id, is_reporting=0)
+        ACTIVE_REPORTS.pop(tg_id, None)
+
+        if session_paths:
+            asyncio.create_task(
+                _background_suspension_check(tg_id, object_guid, session_paths[0])
+            )
 
 
 async def _single_loop(
@@ -1348,9 +1721,10 @@ async def _single_loop(
     delay: int,
     label: str,
     tg_id: int,
-) -> tuple[int, int]:
-    sent   = 0
+) -> tuple[int, int, bool]:
+    sent = 0
     failed = 0
+    suspended = False
     try:
         client = RubikaClient(name=session_path)
         async with client:
@@ -1365,12 +1739,15 @@ async def _single_loop(
                     sent += 1
                 except Exception as exc:
                     failed += 1
+                    err = str(exc)
+                    if is_suspension_error(err):
+                        suspended = True
                     logger.error("[%s][%d/%d] %s", label, i, count, exc)
                 if i < count:
                     await asyncio.sleep(delay)
     except Exception as exc:
         logger.error("session %s error: %s", session_path, exc)
-    return sent, failed
+    return sent, failed, suspended
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -1385,8 +1762,8 @@ async def cmd_grant(message: Message) -> None:
         return
     try:
         target_id = int(args[0])
-        months    = int(args[1]) if len(args) > 1 else 1
-        set_premium(target_id, months)
+        months = int(args[1]) if len(args) > 1 else 1
+        set_premium(target_id, months, source="admin_gift")
         await message.answer(f"✅ اشتراک {months} ماهه برای {target_id}")
     except (ValueError, IndexError):
         await message.answer("خطا در آرگومان‌ها.")
@@ -1397,67 +1774,415 @@ async def cmd_stats(message: Message) -> None:
         return
     with sqlite3.connect(DB_PATH) as conn:
         total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        prem  = conn.execute("SELECT COUNT(*) FROM users WHERE is_premium=1").fetchone()[0]
-        reps  = conn.execute("SELECT SUM(total_reports) FROM users").fetchone()[0] or 0
+        prem = conn.execute("SELECT COUNT(*) FROM users WHERE is_premium=1").fetchone()[0]
+        reps = conn.execute("SELECT SUM(total_reports) FROM users").fetchone()[0] or 0
     await message.answer(f"📊 آمار\n👥 {total}\n👑 {prem}\n📢 {reps}")
 
 
+async def cmd_admin(message: Message, state: FSMContext) -> None:
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer("🛠 پنل مدیریت", reply_markup=kb_admin_panel())
+    await state.set_state(Form.admin_panel)
+
+
+async def cmd_reply(message: Message) -> None:
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("/reply <telegram_id> متن پاسخ")
+        return
+    target_id = int(parts[1])
+    text = message.text[len(parts[0]) + len(parts[1]) + 2:].strip()
+    try:
+        await message.bot.send_message(chat_id=target_id, text=f"💬 پاسخ پشتیبانی:\n{text}")
+        await message.answer("✅ پاسخ ارسال شد.")
+    except Exception as exc:
+        await message.answer(f"❌ خطا: {exc}")
+
+
+def _admin_user_line(u: dict) -> str:
+    uid = u.get("telegram_id")
+    custom = is_custom_active(u)
+    prem = is_premium_active(u)
+    if custom:
+        badge = "💎"
+    elif prem:
+        badge = "👑"
+    else:
+        badge = "🆓"
+    live = " 🟢" if u.get("is_reporting") else ""
+    return f"{badge} <code>{uid}</code>{live} | 📊 {u.get('total_reports', 0)}"
+
+
+def _admin_user_detail_text(u: dict) -> str:
+    uid = u.get("telegram_id")
+    lines = [f"👤 کاربر <code>{uid}</code>\n"]
+    if is_custom_active(u):
+        lines.append(f"💎 اشتراک سفارشی: {u.get('custom_quota')} گزارش/نوع")
+        lines.append(f"   تا {str(u.get('custom_expiry'))[:16]}")
+    if is_premium_active(u):
+        lines.append(f"👑 پریمیوم تا {str(u.get('premium_until'))[:16]}")
+    if not is_custom_active(u) and not is_premium_active(u):
+        lines.append("🆓 رایگان")
+    lines.append(f"📌 منبع اشتراک: {u.get('subscription_source', 'free')}")
+    lines.append(f"📊 کل گزارش‌ها: {u.get('total_reports', 0)}")
+    lines.append(f"👥 دعوت‌ها: {u.get('total_invites', 0)}")
+    lines.append(f"📅 ثبت: {str(u.get('created_at', '-'))[:16]}")
+    if u.get("is_reporting"):
+        lines.append("🟢 در حال گزارش‌دهی (همین حالا)")
+    return "\n".join(lines)
+
+
+async def _show_admin_users(callback: CallbackQuery, page: int = 0) -> None:
+    users = get_all_users()
+    per = 8
+    total_pages = max((len(users) + per - 1) // per, 1)
+    page = max(0, min(page, total_pages - 1))
+    chunk = users[page * per:(page + 1) * per]
+    text = f"👥 لیست کاربران (صفحه {page + 1}/{total_pages})\n\n"
+    if not chunk:
+        text += "هیچ کاربری ثبت نشده."
+    else:
+        text += "\n".join(_admin_user_line(u) for u in chunk)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb_admin_users(page, total_pages), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb_admin_users(page, total_pages), parse_mode="HTML")
+
+
+async def _show_admin_logs(callback: CallbackQuery, page: int = 0) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        total = conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+        per = 8
+        total_pages = max((total + per - 1) // per, 1)
+        page = max(0, min(page, total_pages - 1))
+        rows = conn.execute(
+            "SELECT * FROM reports ORDER BY reported_at DESC LIMIT ? OFFSET ?",
+            (per, page * per),
+        ).fetchall()
+
+    lines = [f"📋 لاگ گزارش‌ها (صفحه {page + 1}/{total_pages})\n"]
+    if not rows:
+        lines.append("هیچ گزارشی ثبت نشده.")
+    else:
+        for r in rows:
+            badge = "🚫" if r["is_suspended"] else "✅"
+            g = (r["target_guid"] or "—")
+            g_short = g if len(g) <= 20 else g[:18] + "…"
+            lines.append(
+                f"{badge} {r['report_type']} | ×{r['count']}\n"
+                f"   🆔 <code>{g_short}</code>\n"
+                f"   👤 <code>{r['telegram_id']}</code> | 📅 {str(r['reported_at'])[:16]}"
+            )
+    try:
+        await callback.message.edit_text("\n".join(lines), reply_markup=kb_admin_logs(page, total_pages), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer("\n".join(lines), reply_markup=kb_admin_logs(page, total_pages), parse_mode="HTML")
+
+
+async def _show_admin_live(callback: CallbackQuery) -> None:
+    if not ACTIVE_REPORTS:
+        text = "🟢 هیچ گزارشی در حال اجرا نیست."
+    else:
+        lines = ["🟢 گزارش‌های در حال اجرا:\n"]
+        for tg_id, info in ACTIVE_REPORTS.items():
+            elapsed = int((datetime.now() - info["start"]).total_seconds())
+            g = info["target"]
+            g_short = g if len(g) <= 20 else g[:18] + "…"
+            lines.append(
+                f"👤 <code>{tg_id}</code>\n"
+                f"   🎯 <code>{g_short}</code>\n"
+                f"   📊 {info['progress']}/{info['count']} | ⏱ {elapsed}s"
+            )
+        text = "\n".join(lines)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb_admin_live(), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb_admin_live(), parse_mode="HTML")
+
+
+async def admin_panel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ فقط ادمین", show_alert=True)
+        return
+
+    data = callback.data
+
+    if data == "noop":
+        await callback.answer()
+        return
+
+    if data.startswith("admin_users_"):
+        await callback.answer()
+        try:
+            page = int(data.split("_")[-1])
+        except ValueError:
+            page = 0
+        await _show_admin_users(callback, page)
+        return
+
+    if data.startswith("admin_logs_"):
+        await callback.answer()
+        try:
+            page = int(data.split("_")[-1])
+        except ValueError:
+            page = 0
+        await _show_admin_logs(callback, page)
+        return
+
+    if data == "admin_live":
+        await callback.answer()
+        await _show_admin_live(callback)
+        return
+
+    if data == "admin_panel":
+        await callback.answer()
+        try:
+            await callback.message.edit_text("🛠 پنل مدیریت", reply_markup=kb_admin_panel())
+        except Exception:
+            await callback.message.answer("🛠 پنل مدیریت", reply_markup=kb_admin_panel())
+        await state.set_state(Form.admin_panel)
+        return
+
+    if data == "admin_stats":
+        await callback.answer()
+        users = get_all_users()
+        total = len(users)
+        prem = sum(1 for u in users if is_premium_active(u))
+        custom = sum(1 for u in users if is_custom_active(u))
+        reps = sum(u.get("total_reports", 0) for u in users)
+        with sqlite3.connect(DB_PATH) as conn:
+            sess = conn.execute("SELECT COUNT(*) FROM users WHERE rubika_session IS NOT NULL").fetchone()[0]
+            total_reports_logged = conn.execute("SELECT COALESCE(SUM(count),0) FROM reports").fetchone()[0]
+            suspended_targets = conn.execute(
+                "SELECT COUNT(DISTINCT telegram_id || ':' || target_guid) FROM reports WHERE is_suspended = 1"
+            ).fetchone()[0]
+        await callback.message.answer(
+            f"📊 آمار ربات\n\n"
+            f"👥 کل کاربران: {total}\n"
+            f"👑 پریمیوم فعال: {prem}\n"
+            f"💎 اشتراک سفارشی فعال: {custom}\n"
+            f"🔐 سشن‌های ثبت‌شده: {sess}\n"
+            f"📢 مجموع گزارشات: {reps}\n"
+            f"📋 رکوردهای گزارش: {total_reports_logged}\n"
+            f"🚫 اهداف تعلیق‌شده: {suspended_targets}",
+            reply_markup=kb_admin_panel(),
+        )
+        return
+
+    if data == "admin_broadcast":
+        await callback.answer()
+        await callback.message.answer(
+            "📢 پیام همگانی\nپیام، عکس یا فایل خود را بفرستید تا به تمام کاربران ارسال شود:",
+            reply_markup=kb_menu_return(),
+        )
+        await state.set_state(Form.broadcast)
+        return
+
+    if data == "admin_support":
+        await callback.answer()
+        await callback.message.answer(
+            "💬 پشتیبانی\nوقتی کاربر پیام بفرستد، با دکمه «پاسخ» فوروارد می‌شود.",
+            reply_markup=kb_admin_panel(),
+        )
+        return
+
+    if data == "admin_exit":
+        await callback.answer()
+        await callback.message.answer("🚪 خروج از پنل.", reply_markup=kb_menu_return())
+        await state.set_state(Form.main_menu)
+        return
+
+    if data == "admin_custom_sub":
+        await callback.answer()
+        await state.set_state(AdminGrantFlow.waiting_user)
+        await callback.message.answer(
+            "💎 اعطای اشتراک سفارشی\n\n"
+            "مرحله ۱/۳: آیدی تلگرام کاربر را بفرستید:\n"
+            "مثال: <code>123456789</code>",
+            reply_markup=kb_cancel_admin_flow(),
+            parse_mode="HTML",
+        )
+        return
+
+    if data.startswith("admin_user_"):
+        await callback.answer()
+        try:
+            uid = int(data.split("_")[-1])
+        except ValueError:
+            return
+        user = get_user(uid)
+        if not user:
+            await callback.message.answer("❌ کاربر یافت نشد.", reply_markup=kb_admin_panel())
+            return
+        await callback.message.answer(
+            _admin_user_detail_text(user),
+            reply_markup=kb_user_detail(uid),
+            parse_mode="HTML",
+        )
+        return
+
+    if data.startswith("admin_clear_sub_"):
+        await callback.answer()
+        try:
+            uid = int(data.split("_")[-1])
+        except ValueError:
+            return
+        clear_subscription(uid)
+        await callback.message.answer(f"🗑 اشتراک کاربر <code>{uid}</code> حذف شد.", parse_mode="HTML")
+        return
+
+    if data.startswith("admin_gift_"):
+        await callback.answer()
+        try:
+            uid = int(data.split("_")[-1])
+        except ValueError:
+            return
+        await state.update_data(grant_target=uid)
+        await state.set_state(AdminGrantFlow.waiting_quota)
+        await callback.message.answer(
+            f"💎 اعطای اشتراک برای <code>{uid}</code>\n\n"
+            f"مرحله ۲/۳: تعداد گزارش در هر نوع را وارد کنید:\n"
+            f"مثال: <code>2000</code>",
+            reply_markup=kb_cancel_admin_flow(),
+            parse_mode="HTML",
+        )
+        return
+
+
+async def grant_flow_user(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ آیدی عددی معتبر بفرستید.")
+        return
+    uid = int(text)
+    user = get_user(uid)
+    if not user:
+        await message.answer("❌ کاربر یافت نشد. آیدی دیگری بفرستید یا انصراف دهید.")
+        return
+    await state.update_data(grant_target=uid)
+    await state.set_state(AdminGrantFlow.waiting_quota)
+    await message.answer(
+        f"✅ کاربر <code>{uid}</code> پیدا شد.\n\n"
+        f"مرحله ۲/۳: تعداد گزارش در هر نوع را وارد کنید:\n"
+        f"مثال: <code>2000</code>",
+        reply_markup=kb_cancel_admin_flow(),
+        parse_mode="HTML",
+    )
+
+
+async def grant_flow_quota(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text.isdigit() or int(text) < 1:
+        await message.answer("❌ عدد مثبت وارد کنید.")
+        return
+    quota = int(text)
+    await state.update_data(grant_quota=quota)
+    await state.set_state(AdminGrantFlow.waiting_duration)
+    await message.answer(
+        f"✅ تعداد {quota} گزارش در هر نوع ثبت شد.\n\n"
+        f"مرحله ۳/۳: مدت اعتبار را وارد کنید:\n"
+        f"فرمت: عدد + واحد (d=روز، h=ساعت، m=دقیقه)\n"
+        f"مثال: <code>7d</code> (یک هفته) یا <code>1h</code> (یک ساعت) یا <code>30d</code>",
+        reply_markup=kb_cancel_admin_flow(),
+        parse_mode="HTML",
+    )
+
+
+async def grant_flow_duration(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    td = parse_duration(text)
+    if td is None:
+        await message.answer(
+            "❌ فرمت نامعتبر. مثال: <code>7d</code>, <code>1h</code>, <code>30m</code>",
+            parse_mode="HTML",
+        )
+        return
+    data = await state.get_data()
+    uid = data.get("grant_target")
+    quota = data.get("grant_quota")
+    if not uid or not quota:
+        await message.answer("❌ اطلاعات ناقص. دوباره از پنل شروع کنید.", reply_markup=kb_admin_panel())
+        await state.set_state(Form.admin_panel)
+        return
+
+    set_custom_subscription(uid, quota, td)
+    await state.update_data(grant_target=None, grant_quota=None)
+
+    expiry = (datetime.now() + td).isoformat()
+    await message.answer(
+        f"✅ اشتراک سفارشی اعطا شد.\n\n"
+        f"👤 کاربر: <code>{uid}</code>\n"
+        f"📊 تعداد گزارش در هر نوع: {quota}\n"
+        f"⏱ مدت: {format_duration(td)}\n"
+        f"📅 اعتبار تا: {expiry[:16]}",
+        reply_markup=kb_admin_panel(),
+        parse_mode="HTML",
+    )
+    await state.set_state(Form.admin_panel)
+
+    try:
+        await message.bot.send_message(
+            chat_id=uid,
+            text=(
+                f"🎁 اشتراک ویژه به شما اعطا شد!\n\n"
+                f"📊 تعداد گزارش در هر نوع: {quota}\n"
+                f"⏱ مدت اعتبار: {format_duration(td)}\n"
+                f"📅 تا: {expiry[:16]}"
+            ),
+        )
+    except Exception:
+        pass
+
+
 # ────────────────────────────────────────────────────────────────────────
-#  Support (ارتباط با ما / پشتیبانی)
+#  Support
 # ────────────────────────────────────────────────────────────────────────
 async def receive_support_message(message: Message, state: FSMContext) -> None:
     tg_id = message.from_user.id
-    user  = get_user(tg_id)
-
     sent = False
     for admin_id in ADMIN_IDS:
         try:
             forwarded = await message.forward(chat_id=admin_id)
             await forwarded.reply(
-                f"📨 پیام پشتیبانی جدید\n"
-                f"👤 کاربر: {user.get('phone', '-') if user else '-'}\n"
-                f"🆔 تلگرام: {tg_id}",
+                f"📨 پیام پشتیبانی جدید\n🆔 تلگرام: {tg_id}",
                 reply_markup=kb_admin_reply(tg_id),
             )
             sent = True
         except Exception as exc:
             logger.error("forward support to admin %d: %s", admin_id, exc)
-
     if sent:
-        await message.answer(
-            "✅ پیام شما برای پشتیبانی ارسال شد.\n"
-            "منتظر پاسخ بمانید؛ پاسخ از همینجا برایتان ارسال می‌شود.",
-            reply_markup=kb_menu_return(),
-        )
+        await message.answer("✅ پیام شما برای پشتیبانی ارسال شد.", reply_markup=kb_menu_return())
     else:
-        await message.answer("❌ ارسال پیام به پشتیبانی ممکن نشد. بعداً تلاش کنید.")
+        await message.answer("❌ ارسال پیام به پشتیبانی ممکن نشد.")
     await state.set_state(Form.main_menu)
 
 
 async def admin_reply_to_user(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ فقط ادمین", show_alert=True)
         return
+    await callback.answer()
     target_id = int(callback.data.split("_")[-1])
     await state.update_data(reply_target=target_id)
     await state.set_state(Form.admin_reply)
     await callback.message.answer(
-        f"💬 در حال پاسخ به کاربر {target_id}\n"
-        "پیام، عکس یا فایل خود را بفرستید تا برای کاربر ارسال شود:",
+        f"💬 در حال پاسخ به کاربر {target_id}\nپیام، عکس یا فایل خود را بفرستید:",
         reply_markup=kb_menu_return(),
     )
 
 
-async def admin_close_ticket(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
+async def admin_close_ticket(callback: CallbackQuery) -> None:
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("⛔ فقط ادمین", show_alert=True)
         return
+    await callback.answer()
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
-        closed_text = (callback.message.text or "") + "\n\n🚫 تیکت بسته شد."
-        await callback.message.edit_text(closed_text)
+        await callback.message.edit_text((callback.message.text or "") + "\n\n🚫 تیکت بسته شد.")
     except Exception:
         pass
 
@@ -1471,7 +2196,7 @@ async def receive_admin_reply(message: Message, state: FSMContext) -> None:
         try:
             target_id = int(parts[0])
             months = int(parts[1]) if len(parts) > 1 else 1
-            set_premium(target_id, months)
+            set_premium(target_id, months, source="admin_gift")
             await message.answer(f"✅ اشتراک {months} ماهه برای {target_id} فعال شد.", reply_markup=kb_admin_panel())
         except (ValueError, IndexError):
             await message.answer("❌ فرمت نادرست. مثال: 123456789 1", reply_markup=kb_admin_panel())
@@ -1483,97 +2208,11 @@ async def receive_admin_reply(message: Message, state: FSMContext) -> None:
         return
     try:
         await message.forward(chat_id=target_id)
-        await message.answer("✅ پاسخ برای کاربر ارسال شد.", reply_markup=kb_admin_panel())
+        await message.answer("✅ پاسخ ارسال شد.", reply_markup=kb_admin_panel())
     except Exception as exc:
         logger.error("admin reply to %d: %s", target_id, exc)
-        await message.answer(f"❌ ارسال پاسخ ناموفق: {exc}", reply_markup=kb_admin_panel())
+        await message.answer(f"❌ ناموفق: {exc}", reply_markup=kb_admin_panel())
     await state.set_state(Form.admin_panel)
-
-
-# ────────────────────────────────────────────────────────────────────────
-#  Admin panel
-# ────────────────────────────────────────────────────────────────────────
-async def cmd_admin(message: Message, state: FSMContext) -> None:
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    await message.answer("🛠 پنل مدیریت", reply_markup=kb_admin_panel())
-    await state.set_state(Form.admin_panel)
-
-
-async def admin_panel_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("⛔ فقط ادمین", show_alert=True)
-        return
-    data = callback.data
-    bot  = callback.bot
-
-    if data == "admin_exit":
-        await callback.message.answer("🚪 خروج از پنل.", reply_markup=kb_menu_return())
-        await state.set_state(Form.main_menu)
-        return
-
-    if data == "admin_broadcast":
-        await callback.message.answer(
-            "📢 پیام همگانی\n"
-            "پیام، عکس یا فایل خود را بفرستید تا به تمام کاربران ربات ارسال شود:",
-            reply_markup=kb_menu_return(),
-        )
-        await state.set_state(Form.broadcast)
-        return
-
-    if data == "admin_stats":
-        total = count_users()
-        users = get_all_users()
-        prem  = sum(1 for u in users if is_premium_active(u))
-        reps  = sum(u.get("total_reports", 0) for u in users)
-        with sqlite3.connect(DB_PATH) as conn:
-            sess = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE rubika_session IS NOT NULL"
-            ).fetchone()[0]
-        await callback.message.answer(
-            f"📊 آمار ربات\n\n"
-            f"👥 کل کاربران: {total}\n"
-            f"👑 اشتراکی‌ها: {prem}\n"
-            f"🔐 سشن‌های فعال: {sess}\n"
-            f"📢 کل گزارشات: {reps}",
-            reply_markup=kb_admin_panel(),
-        )
-        return
-
-    if data == "admin_grant":
-        await callback.message.answer(
-            "👑 تمدید اشتراک\n"
-            "فرمت: <telegram_id> <months>\nمثال: 123456789 1",
-            reply_markup=kb_menu_return(),
-        )
-        await state.set_state(Form.admin_reply)
-        await state.update_data(grant_mode=True)
-        return
-
-    if data == "admin_support":
-        await callback.message.answer(
-            "💬 پشتیبانی\n"
-            "وقتی کاربری پیام پشتیبانی بفرستد، پیام همراه با دکمه «پاسخ» برایتان فوروارد می‌شود.\n"
-            "روی «پاسخ به کاربر» بزنید و پاسخ را بفرستید.",
-            reply_markup=kb_admin_panel(),
-        )
-        return
-
-    if data == "admin_list":
-        users = get_all_users()
-        if not users:
-            await callback.message.answer("هیچ کاربری ثبت نشده.", reply_markup=kb_admin_panel())
-            return
-        lines = []
-        for u in users[-30:]:
-            pid = u.get("telegram_id")
-            phone = u.get("phone", "-")
-            prem = "👑" if is_premium_active(u) else "🆓"
-            lines.append(f"{prem} {pid} | {phone}")
-        text = "📨 لیست کاربران (آخرین ۳۰ نفر):\n" + "\n".join(lines)
-        await callback.message.answer(text, reply_markup=kb_admin_panel())
-        return
 
 
 async def receive_broadcast(message: Message, state: FSMContext) -> None:
@@ -1599,24 +2238,8 @@ async def receive_broadcast(message: Message, state: FSMContext) -> None:
     await state.set_state(Form.admin_panel)
 
 
-async def cmd_reply(message: Message) -> None:
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("/reply <telegram_id> متن پاسخ")
-        return
-    target_id = int(parts[1])
-    text = message.text[len(parts[0]) + len(parts[1]) + 2:].strip()
-    try:
-        await message.bot.send_message(chat_id=target_id, text=f"💬 پاسخ پشتیبانی:\n{text}")
-        await message.answer("✅ پاسخ ارسال شد.")
-    except Exception as exc:
-        await message.answer(f"❌ خطا: {exc}")
-
-
 # ────────────────────────────────────────────────────────────────────────
-#  Global error handler (برای دیدن خطای کالبک‌ها)
+#  Global error handler
 # ────────────────────────────────────────────────────────────────────────
 async def global_error_handler(update: Update, exception: Exception) -> bool:
     logger.exception("UNHANDLED EXCEPTION: %s", exception)
@@ -1635,12 +2258,15 @@ async def global_error_handler(update: Update, exception: Exception) -> bool:
 # ────────────────────────────────────────────────────────────────────────
 def build_app() -> tuple[Bot, Dispatcher]:
     init_db()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE users SET is_reporting = 0")
+        conn.commit()
+
     bot = Bot(token=TELEGRAM_TOKEN)
     dp = Dispatcher()
     router = Router()
 
-   # ── پیام‌ها ──
-    # ── پیام‌ها ──
     router.message.register(cmd_start, CommandStart())
     router.message.register(receive_phone, Form.phone, F.contact | (F.text & ~F.text.startswith("/")))
     router.message.register(receive_password, Form.password, F.text & ~F.text.startswith("/"))
@@ -1655,26 +2281,32 @@ def build_app() -> tuple[Bot, Dispatcher]:
     router.message.register(receive_support_message, Form.support_message)
     router.message.register(receive_broadcast, Form.broadcast)
     router.message.register(receive_admin_reply, Form.admin_reply)
+
+    router.message.register(grant_flow_user, AdminGrantFlow.waiting_user, F.text & ~F.text.startswith("/"))
+    router.message.register(grant_flow_quota, AdminGrantFlow.waiting_quota, F.text & ~F.text.startswith("/"))
+    router.message.register(grant_flow_duration, AdminGrantFlow.waiting_duration, F.text & ~F.text.startswith("/"))
+
     router.message.register(cmd_stop, Command("stop"))
     router.message.register(cmd_grant, Command("grant"))
     router.message.register(cmd_stats, Command("stats"))
     router.message.register(cmd_admin, Command("admin", "panel"))
     router.message.register(cmd_reply, Command("reply"))
 
-    # ── کالبک‌ها ──
-    # هندلرهای خاص را اول ثبت کن (اولویت بالاتر) تا توسط process_callback سایه نشوند
     router.callback_query.register(admin_approve_sub, F.data.startswith("approve_sub_") | F.data.startswith("reject_sub_"))
     router.callback_query.register(check_join_callback, F.data == "check_join")
 
-    # ── ادمین (باید قبل از process_callback ثبت شوند تا توسط فیلتر استیت کور نشوند) ──
     router.callback_query.register(admin_reply_to_user, F.data.startswith("admin_reply_"))
     router.callback_query.register(admin_close_ticket, F.data == "admin_close_ticket")
+
     router.callback_query.register(admin_panel_callback, F.data.startswith("admin_"))
 
-    # منوی اصلی و بخش‌های گزارش (محدود به استیت)
+    router.callback_query.register(process_callback, F.data.startswith("myreports_"))
+    router.callback_query.register(process_callback, F.data == "refresh_statuses")
+
     router.callback_query.register(process_callback, Form.main_menu)
     router.callback_query.register(process_callback, Form.report_types)
     router.callback_query.register(process_callback, Form.report_guid)
+
     router.callback_query.register(back_to_menu, Form.report_resolve, F.data == "back_menu")
     router.callback_query.register(back_to_menu, Form.report_other_text, F.data == "back_menu")
     router.callback_query.register(back_to_menu, Form.report_count, F.data == "back_menu")
@@ -1683,12 +2315,13 @@ def build_app() -> tuple[Bot, Dispatcher]:
     router.callback_query.register(back_to_menu, Form.receipt, F.data == "back_menu")
     router.callback_query.register(back_to_menu, Form.report_guid, F.data == "back_menu")
     router.callback_query.register(back_to_menu, Form.support_message, F.data == "back_menu")
-    router.callback_query.register(back_to_menu, Form.admin_panel, F.data == "back_menu")
     router.callback_query.register(back_to_menu, Form.broadcast, F.data == "back_menu")
     router.callback_query.register(back_to_menu, Form.admin_reply, F.data == "back_menu")
 
-    # fallback: اگر استیت از دست رفته باشد (مثلاً بعد از ری‌استارت بات)
-    # باز هم دکمه‌ها جواب بدهند
+    router.callback_query.register(back_to_menu, AdminGrantFlow.waiting_user, F.data == "admin_panel")
+    router.callback_query.register(back_to_menu, AdminGrantFlow.waiting_quota, F.data == "admin_panel")
+    router.callback_query.register(back_to_menu, AdminGrantFlow.waiting_duration, F.data == "admin_panel")
+
     router.callback_query.register(process_callback)
 
     dp.include_router(router)
