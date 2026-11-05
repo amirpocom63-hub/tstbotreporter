@@ -266,25 +266,42 @@ def kb_force_join() -> InlineKeyboardMarkup:
 # ────────────────────────────────────────────────────────────────────────
 #  Rubika auth
 # ────────────────────────────────────────────────────────────────────────
+# جایگزین تابع rubika_send_code در کد خود کنید
 async def rubika_send_code(phone: str, pass_key: str = None) -> dict:
-    tmp_path = os.path.join(SESSIONS_DIR, f"tmp_{phone}")
-    client = RubikaClient(name=tmp_path)
-    await client.connect()
+    # استفاده از نام سشن به جای مسیر کامل فایل
+    session_name = f"tmp_{phone}"
+    client = RubikaClient(name=session_name)  # name باید نام سشن باشد
+    
     try:
+        await client.connect()
+        
+        # در صورتی که حساب تایید دو مرحله‌ای دارد، pass_key را ارسال کنید
         kwargs = {"phone_number": phone, "send_type": "SMS"}
         if pass_key is not None:
             kwargs["pass_key"] = pass_key
+            
         result = await client.send_code(**kwargs)
+        
+        # اگر وضعیت SendPassKey بود، یعنی کد ارسال نشده و نیاز به رمز است
+        if result.status == "SendPassKey":
+            logger.warning("حساب نیاز به رمز دو مرحله‌ای دارد. hint: %s", getattr(result, "hint_pass_key", None))
+            return {
+                "status": result.status,
+                "phone_code_hash": result.phone_code_hash,
+                "hint_pass_key": getattr(result, "hint_pass_key", None),
+            }
+        
         return {
             "status": result.status,
             "phone_code_hash": result.phone_code_hash,
-            "hint_pass_key": getattr(result, "hint_pass_key", None),
         }
     except Exception as e:
+        logger.error("خطا در ارسال کد به %s: %s", phone, e, exc_info=True)  # لاگ کامل خطا
         raise RuntimeError(f"خطا در ارسال کد: {e}")
     finally:
         await client.disconnect()
-        cleanup_session_files(tmp_path)
+        # پاک‌سازی فایل‌های موقت سشن
+        cleanup_session_files(os.path.join(SESSIONS_DIR, session_name))
 
 async def rubika_sign_in(phone: str, code: str, phone_code_hash: str) -> dict:
     session_name = f"user_{phone}"
